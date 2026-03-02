@@ -9,6 +9,8 @@ package main
 #include "JabraDeviceConfig.h"
 #include "Interface_AmbienceModes.h"
 #include "Interface_Firmware.h"
+#include "Interface_Bluetooth.h"
+#include "Interface_Constants.h"
 #include <stdlib.h>
 */
 import "C"
@@ -246,6 +248,10 @@ var (
 	headDetectionRight bool
 	headDetectionSet   bool
 
+	// BT Link Quality state
+	linkQualityStatus int // 0=OFF, 1=LOW, 2=HIGH
+	linkQualitySet    bool
+
 	// PipeWire audio state
 	currentAudioState *audioState
 )
@@ -312,6 +318,11 @@ func deviceAttachedFunc(deviceInfo C.Jabra_DeviceInfo) {
 				(C.HeadDetectionStatusListener)(C.headDetectionStatusFunc),
 			)
 		}
+		// Register link quality listener (silently ignores Not_Supported)
+		C.Jabra_SetLinkQualityStatusListener(
+			C.ushort(goDeviceInfo.deviceID),
+			(C.LinkQualityStatusListener)(C.linkQualityStatusFunc),
+		)
 	} else {
 		if goDeviceInfo.featureFlags.pairingList {
 			goDeviceInfo.pairingList = getPairingList(goDeviceInfo.deviceID)
@@ -334,6 +345,12 @@ func headDetectionStatusFunc(deviceID C.ushort, status C.HeadDetectionStatus) {
 	headDetectionLeft = bool(status.leftOn)
 	headDetectionRight = bool(status.rightOn)
 	headDetectionSet = true
+}
+
+//export linkQualityStatusFunc
+func linkQualityStatusFunc(deviceID C.ushort, status C.LinkQuality) {
+	linkQualityStatus = int(status)
+	linkQualitySet = true
 }
 
 // //export buttonInDataRawHidFunc
@@ -591,6 +608,7 @@ func (d *devices) removed(deviceID uint16) {
 	if !checkHeadSetExists {
 		stopUpdateBattery <- struct{}{}
 		selectedHeadset = -1
+		linkQualitySet = false
 	}
 
 	*d = newDevices
@@ -1206,6 +1224,69 @@ func setEqualizerParameters(deviceID uint16, gains []float32) error {
 /****************************************************************************/
 /*                             DEVICE INFO                                  */
 /****************************************************************************/
+
+func getConnectedBTDeviceName(deviceID uint16) string {
+	cName := C.Jabra_GetConnectedBTDeviceName(C.ushort(deviceID))
+	if cName == nil {
+		return ""
+	}
+	name := C.GoString(cName)
+	C.Jabra_FreeString(cName)
+	return name
+}
+
+func getSecureConnectionMode(deviceID uint16) string {
+	var mode C.Jabra_SecureConnectionMode
+	if err := returnCode(int(C.Jabra_GetSecureConnectionMode(C.ushort(deviceID), &mode))); err != nil {
+		return ""
+	}
+	switch int(mode) {
+	case 0:
+		return "Legacy"
+	case 1:
+		return "Secure"
+	case 2:
+		return "Restricted"
+	default:
+		return fmt.Sprintf("Unknown (%d)", int(mode))
+	}
+}
+
+func getDeviceConstantLines(deviceID uint16) []string {
+	var lines []string
+	constants := C.Jabra_GetConstants(C.ushort(deviceID))
+	if constants == nil {
+		return lines
+	}
+	defer C.Jabra_ReleaseConst(constants)
+
+	keys := []struct {
+		key   string
+		label string
+	}{
+		{"bluetooth_address", "BT Address"},
+		{"model_name", "Model"},
+		{"vendor_name", "Vendor"},
+		{"product_name", "Product"},
+	}
+
+	for _, k := range keys {
+		cKey := C.CString(k.key)
+		val := C.Jabra_GetConst(constants, cKey)
+		C.free(unsafe.Pointer(cKey))
+		if val == nil {
+			continue
+		}
+		if C.Jabra_IsString(val) {
+			str := C.GoString(C.Jabra_AsString(val))
+			if str != "" {
+				lines = append(lines, fmt.Sprintf("  %-10s %s", k.label+":", str))
+			}
+		}
+	}
+
+	return lines
+}
 
 func checkFirmwareUpdate(deviceID uint16) (bool, string) {
 	rc := int(C.Jabra_CheckForFirmwareUpdate(C.ushort(deviceID), nil))

@@ -498,6 +498,18 @@ func header() {
 		strings.Repeat(batteryEmptyChar, emptySegments) +
 		"\033[0m" // Reset color
 
+	btIndicator := ""
+	if linkQualitySet {
+		switch linkQualityStatus {
+		case 2:
+			btIndicator = " [BT:High]"
+		case 1:
+			btIndicator = " [BT:Low]"
+		default:
+			btIndicator = " [BT:Off]"
+		}
+	}
+
 	headIndicator := ""
 	if headset.featureFlags.onHeadDetection && headDetectionSet {
 		switch {
@@ -517,12 +529,13 @@ func header() {
 		}
 	}
 
+	extraLen := len(btIndicator) + len(headIndicator)
 	if headset.batteryStatus.charging {
-		moveCursor(2, width-50-len(headIndicator))
-		fmt.Printf("%s - Battery : [%s]🗲 %d%%%s", headset.deviceName, batteryBar, levelInPercent, headIndicator)
+		moveCursor(2, width-50-extraLen)
+		fmt.Printf("%s - Battery : [%s]🗲 %d%%%s%s", headset.deviceName, batteryBar, levelInPercent, btIndicator, headIndicator)
 	} else {
-		moveCursor(2, width-48-len(headIndicator))
-		fmt.Printf("%s - Battery: [%s] %d%%%s", headset.deviceName, batteryBar, levelInPercent, headIndicator)
+		moveCursor(2, width-48-extraLen)
+		fmt.Printf("%s - Battery: [%s] %d%%%s%s", headset.deviceName, batteryBar, levelInPercent, btIndicator, headIndicator)
 	}
 }
 
@@ -712,6 +725,14 @@ func buildDeviceInfoLines() []string {
 		if sku := getSku(dongle.deviceID); sku != "" {
 			lines = append(lines, fmt.Sprintf("  SKU:       %s", sku))
 		}
+		if name := getConnectedBTDeviceName(dongle.deviceID); name != "" {
+			lines = append(lines, fmt.Sprintf("  Connected: %s", name))
+		}
+		if secMode := getSecureConnectionMode(dongle.deviceID); secMode != "" {
+			lines = append(lines, fmt.Sprintf("  Security:  %s", secMode))
+		}
+		constLines := getDeviceConstantLines(dongle.deviceID)
+		lines = append(lines, constLines...)
 		lines = append(lines, "")
 	}
 
@@ -735,6 +756,8 @@ func buildDeviceInfoLines() []string {
 		if headset.batteryStatus != nil {
 			lines = append(lines, fmt.Sprintf("  Battery:   %d%%", headset.batteryStatus.levelInPercent))
 		}
+		constLines := getDeviceConstantLines(headset.deviceID)
+		lines = append(lines, constLines...)
 		lines = append(lines, "")
 	}
 
