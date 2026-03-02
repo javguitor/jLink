@@ -1100,7 +1100,9 @@ func updateHeadsetSettingsMenu() {
 		return
 	}
 
-	if device.featureFlags.ambienceModes {
+	// Try the API directly — some devices support ambience modes without
+	// reporting the feature flag (e.g. Evolve2 85).
+	if supportedModes, err := getSupportedAmbienceModes(device.deviceID); err == nil && len(supportedModes) > 0 {
 		mode, err := getAmbienceMode(device.deviceID)
 		modeLabel := "ANC Mode: OFF"
 		if err == nil {
@@ -1186,6 +1188,122 @@ func getSupportedAmbienceModes(deviceID uint16) ([]int, error) {
 		result[i] = int(modes[i])
 	}
 	return result, nil
+}
+
+func getSupportedAmbienceModeLevels(deviceID uint16, mode int) (uint8, error) {
+	var levels C.uint8_t
+	if err := returnCode(int(C.Jabra_GetSupportedAmbienceModeLevels(C.ushort(deviceID), C.Jabra_AmbienceMode(mode), &levels))); err != nil {
+		return 0, err
+	}
+	return uint8(levels), nil
+}
+
+func getAmbienceModeLevel(deviceID uint16, mode int) (uint8, error) {
+	var level C.uint8_t
+	if err := returnCode(int(C.Jabra_GetAmbienceModeLevel(C.ushort(deviceID), C.Jabra_AmbienceMode(mode), &level))); err != nil {
+		return 0, err
+	}
+	return uint8(level), nil
+}
+
+func setAmbienceModeLevel(deviceID uint16, mode int, level uint8) error {
+	return returnCode(int(C.Jabra_SetAmbienceModeLevel(C.ushort(deviceID), C.Jabra_AmbienceMode(mode), C.uint8_t(level))))
+}
+
+func getAmbienceModeLoop(deviceID uint16) ([]int, error) {
+	var length C.size_t = 10
+	modes := make([]C.Jabra_AmbienceMode, length)
+	if err := returnCode(int(C.Jabra_GetAmbienceModeLoop(C.ushort(deviceID), &modes[0], &length))); err != nil {
+		return nil, err
+	}
+	result := make([]int, int(length))
+	for i := 0; i < int(length); i++ {
+		result[i] = int(modes[i])
+	}
+	return result, nil
+}
+
+func setAmbienceModeLoop(deviceID uint16, modes []int) error {
+	if len(modes) == 0 {
+		return returnCode(int(C.Jabra_SetAmbienceModeLoop(C.ushort(deviceID), nil, 0)))
+	}
+	cModes := make([]C.Jabra_AmbienceMode, len(modes))
+	for i, m := range modes {
+		cModes[i] = C.Jabra_AmbienceMode(m)
+	}
+	return returnCode(int(C.Jabra_SetAmbienceModeLoop(C.ushort(deviceID), &cModes[0], C.size_t(len(cModes)))))
+}
+
+type ancScreenState struct {
+	supportedModes []int
+	currentMode    int
+	maxLevels      map[int]uint8 // mode -> max level (0 = no levels)
+	currentLevels  map[int]uint8 // mode -> current level
+	loopModes      []int
+	loopSupported  bool
+}
+
+var currentANCState *ancScreenState
+
+func initANCScreenState(deviceID uint16) {
+	supportedModes, err := getSupportedAmbienceModes(deviceID)
+	if err != nil {
+		return
+	}
+	currentMode, _ := getAmbienceMode(deviceID)
+
+	state := &ancScreenState{
+		supportedModes: supportedModes,
+		currentMode:    currentMode,
+		maxLevels:      make(map[int]uint8),
+		currentLevels:  make(map[int]uint8),
+	}
+
+	for _, m := range supportedModes {
+		maxLvl, err := getSupportedAmbienceModeLevels(deviceID, m)
+		if err == nil && maxLvl > 0 {
+			state.maxLevels[m] = maxLvl
+			curLvl, err := getAmbienceModeLevel(deviceID, m)
+			if err == nil {
+				state.currentLevels[m] = curLvl
+			}
+		}
+	}
+
+	// Try the loop API directly — don't rely only on the feature flag
+	loopModes, err := getAmbienceModeLoop(deviceID)
+	if err == nil {
+		state.loopSupported = true
+		state.loopModes = loopModes
+	}
+
+	currentANCState = state
+}
+
+func toggleModeInLoop(mode int) {
+	if currentANCState == nil {
+		return
+	}
+	for i, m := range currentANCState.loopModes {
+		if m == mode {
+			currentANCState.loopModes = append(currentANCState.loopModes[:i], currentANCState.loopModes[i+1:]...)
+			return
+		}
+	}
+	currentANCState.loopModes = append(currentANCState.loopModes, mode)
+}
+
+func ambienceModeName(mode int) string {
+	switch mode {
+	case 0:
+		return "OFF"
+	case 1:
+		return "HearThrough"
+	case 2:
+		return "ANC"
+	default:
+		return fmt.Sprintf("Mode %d", mode)
+	}
 }
 
 /****************************************************************************/

@@ -208,22 +208,9 @@ func startKeysPressedListener() {
 			case '\r':
 				if len(headsetSettingsMenu) > 0 {
 					switch headsetSettingsMenu[currentSelection].id {
-					case 0: // ANC Mode toggle
-						if device, exists := deviceManager[selectedHeadset]; exists {
-							supportedModes, err := getSupportedAmbienceModes(device.deviceID)
-							if err == nil && len(supportedModes) > 0 {
-								currentMode, _ := getAmbienceMode(device.deviceID)
-								nextIdx := 0
-								for i, m := range supportedModes {
-									if m == currentMode {
-										nextIdx = (i + 1) % len(supportedModes)
-										break
-									}
-								}
-								setAmbienceMode(device.deviceID, supportedModes[nextIdx])
-								updateHeadsetSettingsMenu()
-							}
-						}
+					case 0: // ANC Mode -> open ANC settings sub-screen
+						menuState = 9
+						resetCurrentSelection = false
 					case 1: // Equalizer
 						menuState = 7
 						resetCurrentSelection = false
@@ -324,6 +311,86 @@ func startKeysPressedListener() {
 					}
 				}
 			}
+		// ############# ANC Settings ##################
+		case 9:
+			switch key {
+			case 'q':
+				menuState = 5
+				resetCurrentSelection = false
+				currentANCState = nil
+				updateHeadsetSettingsMenu()
+			case 'w':
+				handleUpKey()
+			case 's':
+				handleDownKey()
+			case '\r': // Enter
+				if currentANCState != nil {
+					if currentSelection == 0 {
+						// Cycle mode
+						nextIdx := 0
+						for i, m := range currentANCState.supportedModes {
+							if m == currentANCState.currentMode {
+								nextIdx = (i + 1) % len(currentANCState.supportedModes)
+								break
+							}
+						}
+						if device, exists := deviceManager[selectedHeadset]; exists {
+							setAmbienceMode(device.deviceID, currentANCState.supportedModes[nextIdx])
+							currentANCState.currentMode = currentANCState.supportedModes[nextIdx]
+							// Clamp selection if level slider disappeared
+							_, hasLevel := currentANCState.maxLevels[currentANCState.currentMode]
+							if !hasLevel && currentSelection > 0 {
+								currentSelection = 0
+							}
+						}
+					} else if currentANCState.loopSupported {
+						// Toggle loop checkbox
+						_, hasLevel := currentANCState.maxLevels[currentANCState.currentMode]
+						loopStartIdx := 1
+						if hasLevel {
+							loopStartIdx = 2
+						}
+						if currentSelection >= loopStartIdx {
+							loopIdx := currentSelection - loopStartIdx
+							if loopIdx >= 0 && loopIdx < len(currentANCState.supportedModes) {
+								toggleModeInLoop(currentANCState.supportedModes[loopIdx])
+								if device, exists := deviceManager[selectedHeadset]; exists {
+									setAmbienceModeLoop(device.deviceID, currentANCState.loopModes)
+								}
+							}
+						}
+					}
+				}
+			case 'a': // Decrease level (more effect = lower number)
+				if currentANCState != nil && currentSelection == 1 {
+					if maxLvl, ok := currentANCState.maxLevels[currentANCState.currentMode]; ok {
+						curLvl := currentANCState.currentLevels[currentANCState.currentMode]
+						if curLvl > 0 {
+							newLvl := curLvl - 1
+							if device, exists := deviceManager[selectedHeadset]; exists {
+								if setAmbienceModeLevel(device.deviceID, currentANCState.currentMode, newLvl) == nil {
+									currentANCState.currentLevels[currentANCState.currentMode] = newLvl
+								}
+							}
+						}
+						_ = maxLvl
+					}
+				}
+			case 'd': // Increase level (less effect = higher number)
+				if currentANCState != nil && currentSelection == 1 {
+					if maxLvl, ok := currentANCState.maxLevels[currentANCState.currentMode]; ok {
+						curLvl := currentANCState.currentLevels[currentANCState.currentMode]
+						if curLvl < maxLvl {
+							newLvl := curLvl + 1
+							if device, exists := deviceManager[selectedHeadset]; exists {
+								if setAmbienceModeLevel(device.deviceID, currentANCState.currentMode, newLvl) == nil {
+									currentANCState.currentLevels[currentANCState.currentMode] = newLvl
+								}
+							}
+						}
+					}
+				}
+			}
 		// ############# Equalizer ##################
 		case 7:
 			switch key {
@@ -398,6 +465,24 @@ func handleDownKey() {
 	case 7: // Equalizer
 		if currentSelection < len(equalizerBands)-1 {
 			currentSelection++
+		}
+	case 9: // ANC Settings
+		if currentANCState != nil {
+			maxIdx := 0 // mode selector
+			_, hasLevel := currentANCState.maxLevels[currentANCState.currentMode]
+			if hasLevel {
+				maxIdx = 1 // level slider
+			}
+			if currentANCState.loopSupported {
+				loopStart := 1
+				if hasLevel {
+					loopStart = 2
+				}
+				maxIdx = loopStart + len(currentANCState.supportedModes) - 1
+			}
+			if currentSelection < maxIdx {
+				currentSelection++
+			}
 		}
 	case 8: // Audio Settings
 		maxIdx := 0
@@ -914,6 +999,96 @@ func equalizerSettings() {
 	fmt.Println("\033[42m", "Q Back  A/D Adjust", "\033[0m")
 }
 
+func ancSettings() {
+	if !resetCurrentSelection {
+		currentSelection = 0
+		resetCurrentSelection = true
+		if device, exists := deviceManager[selectedHeadset]; exists {
+			initANCScreenState(device.deviceID)
+		}
+	}
+
+	drawingBox()
+
+	if currentANCState == nil {
+		moveCursor(4, 8)
+		fmt.Print("ANC not available")
+		moveCursor(height-3, 7)
+		fmt.Println("\033[42m", "Q Back", "\033[0m")
+		return
+	}
+
+	row := 4
+	// Mode selector
+	modeLabel := fmt.Sprintf("ANC Mode: %s", ambienceModeName(currentANCState.currentMode))
+	if currentSelection == 0 {
+		moveCursor(row, 7)
+		fmt.Printf("\033[42m %s \033[0m  (Enter)", modeLabel)
+	} else {
+		moveCursor(row, 8)
+		fmt.Printf(" %s   (Enter)", modeLabel)
+	}
+	row += 2
+
+	// Level slider (if current mode supports levels)
+	if maxLvl, ok := currentANCState.maxLevels[currentANCState.currentMode]; ok && maxLvl > 0 {
+		curLvl := currentANCState.currentLevels[currentANCState.currentMode]
+		// 0=max effect, maxLvl=min effect. Invert for display: filled = effect strength
+		effectFilled := int(maxLvl) - int(curLvl)
+		effectEmpty := int(curLvl)
+		bar := strings.Repeat("\u2588", effectFilled) + strings.Repeat("\u2591", effectEmpty)
+		levelLabel := fmt.Sprintf("Level: [%s] %d/%d", bar, curLvl, maxLvl)
+		if currentSelection == 1 {
+			moveCursor(row, 7)
+			fmt.Printf("\033[42m %s \033[0m  (A/D)", levelLabel)
+		} else {
+			moveCursor(row, 8)
+			fmt.Printf(" %s   (A/D)", levelLabel)
+		}
+		row += 2
+	}
+
+	// Mode loop checkboxes
+	if currentANCState.loopSupported {
+		moveCursor(row, 8)
+		fmt.Print("--- Mode Loop (Enter to toggle) ---")
+		row++
+
+		_, hasLevel := currentANCState.maxLevels[currentANCState.currentMode]
+		loopStartIdx := 1
+		if hasLevel {
+			loopStartIdx = 2
+		}
+
+		for i, mode := range currentANCState.supportedModes {
+			inLoop := false
+			for _, lm := range currentANCState.loopModes {
+				if lm == mode {
+					inLoop = true
+					break
+				}
+			}
+			check := " "
+			if inLoop {
+				check = "X"
+			}
+			label := fmt.Sprintf("[%s] %s", check, ambienceModeName(mode))
+			itemIdx := loopStartIdx + i
+			if currentSelection == itemIdx {
+				moveCursor(row, 7)
+				fmt.Printf("\033[42m %s \033[0m", label)
+			} else {
+				moveCursor(row, 8)
+				fmt.Print(label)
+			}
+			row++
+		}
+	}
+
+	moveCursor(height-3, 7)
+	fmt.Println("\033[42m", "Q Back  A/D Adjust", "\033[0m")
+}
+
 func startUi() {
 	sigChan := make(chan os.Signal, 1)
 	go func() {
@@ -947,6 +1122,8 @@ func startUi() {
 				case 4: // HeadSet Settings
 					if menuState == 7 {
 						equalizerSettings()
+					} else if menuState == 9 {
+						ancSettings()
 					} else {
 						menuState = 5
 						headsetSettings()
