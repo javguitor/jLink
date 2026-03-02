@@ -5,6 +5,7 @@ package main
 #cgo LDFLAGS: -Llib -ljabra
 
 #include "Common.h"
+#include "GoWrapper.h"
 #include "JabraDeviceConfig.h"
 #include "Interface_AmbienceModes.h"
 #include "Interface_Firmware.h"
@@ -14,6 +15,8 @@ import "C"
 import (
 	"fmt"
 	"log"
+	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 	"unsafe"
@@ -237,7 +240,31 @@ var (
 	// Stop Channels
 	stopUpdateBattery     = make(chan struct{})
 	stopUpdatePairingList = make(chan struct{})
+
+	// Head detection state
+	headDetectionLeft  bool
+	headDetectionRight bool
+	headDetectionSet   bool
+
+	// PipeWire audio state
+	currentAudioState *audioState
 )
+
+type audioProfile struct {
+	index       int
+	name        string
+	description string
+}
+
+type audioState struct {
+	deviceID      int
+	sinkID        int
+	sourceID      int
+	profiles      []audioProfile
+	activeProfile int
+	outputVolume  float64
+	inputVolume   float64
+}
 
 /****************************************************************************/
 /*                             C CALLBACKS	                                */
@@ -279,6 +306,12 @@ func deviceAttachedFunc(deviceInfo C.Jabra_DeviceInfo) {
 		} else {
 			goDeviceInfo.batteryStatus = battery
 		}
+		if goDeviceInfo.featureFlags.onHeadDetection {
+			C.Jabra_SetHeadDetectionStatusListener(
+				C.ushort(goDeviceInfo.deviceID),
+				(C.HeadDetectionStatusListener)(C.headDetectionStatusFunc),
+			)
+		}
 	} else {
 		if goDeviceInfo.featureFlags.pairingList {
 			goDeviceInfo.pairingList = getPairingList(goDeviceInfo.deviceID)
@@ -294,6 +327,13 @@ func deviceAttachedFunc(deviceInfo C.Jabra_DeviceInfo) {
 //export deviceRemovedFunc
 func deviceRemovedFunc(deviceID uint16) {
 	deviceManager.removed(deviceID)
+}
+
+//export headDetectionStatusFunc
+func headDetectionStatusFunc(deviceID C.ushort, status C.HeadDetectionStatus) {
+	headDetectionLeft = bool(status.leftOn)
+	headDetectionRight = bool(status.rightOn)
+	headDetectionSet = true
 }
 
 // //export buttonInDataRawHidFunc
@@ -432,6 +472,13 @@ func updateStartMenu() {
 
 	if len(deviceManager) > 0 {
 		startMenu = append(startMenu, menuItem{id: 6, label: "Device Info"})
+	}
+
+	if currentAudioState == nil {
+		currentAudioState = discoverPipeWireDevice()
+	}
+	if currentAudioState != nil {
+		startMenu = append(startMenu, menuItem{id: 7, label: "Audio Settings"})
 	}
 
 	startMenu = append(startMenu, menuItem{id: 5, label: "Exit"})
@@ -1061,6 +1108,37 @@ func updateHeadsetSettingsMenu() {
 		}
 		headsetSettingsMenu = append(headsetSettingsMenu, menuItem{id: 2, label: fmt.Sprintf("Sidetone: %s", currentLabel)})
 	}
+
+	if device.featureFlags.busyLight || device.featureFlags.manualBusyLight {
+		status := getBusyLightStatus(device.deviceID, device.featureFlags)
+		label := "Busy Light: OFF"
+		if status {
+			label = "Busy Light: ON"
+		}
+		headsetSettingsMenu = append(headsetSettingsMenu, menuItem{id: 3, label: label})
+	}
+}
+
+/****************************************************************************/
+/*                              BUSY LIGHT                                  */
+/****************************************************************************/
+
+func getBusyLightStatus(deviceID uint16, flags *featureFlags) bool {
+	if flags.manualBusyLight {
+		return bool(C.Jabra_GetManualBusylightStatus(C.ushort(deviceID)))
+	}
+	return bool(C.Jabra_GetBusylightStatus(C.ushort(deviceID)))
+}
+
+func setBusyLightStatus(deviceID uint16, on bool, flags *featureFlags) error {
+	if flags.manualBusyLight {
+		val := C.BUSYLIGHT_OFF
+		if on {
+			val = C.BUSYLIGHT_ON
+		}
+		return returnCode(int(C.Jabra_SetManualBusylightStatus(C.ushort(deviceID), C.BusyLightValue(val))))
+	}
+	return returnCode(int(C.Jabra_SetBusylightStatus(C.ushort(deviceID), C.bool(on))))
 }
 
 /****************************************************************************/
@@ -1128,6 +1206,20 @@ func setEqualizerParameters(deviceID uint16, gains []float32) error {
 /****************************************************************************/
 /*                             DEVICE INFO                                  */
 /****************************************************************************/
+
+func checkFirmwareUpdate(deviceID uint16) (bool, string) {
+	rc := int(C.Jabra_CheckForFirmwareUpdate(C.ushort(deviceID), nil))
+	if rc != 17 { // 17 = Firmware_Available
+		return false, ""
+	}
+	fwInfo := C.Jabra_GetLatestFirmwareInformation(C.ushort(deviceID), nil)
+	if fwInfo == nil {
+		return true, ""
+	}
+	version := C.GoString(fwInfo.version)
+	C.Jabra_FreeFirmwareInfo(fwInfo)
+	return true, version
+}
 
 func getFirmwareVersion(deviceID uint16) string {
 	const bufferSize = 64
@@ -1220,4 +1312,236 @@ func setDeviceSetting(deviceID uint16, guid string, key int) error {
 	err := returnCode(int(C.Jabra_SetSettings(C.ushort(deviceID), cSettings)))
 	C.Jabra_FreeDeviceSettings(cSettings)
 	return err
+}
+
+/****************************************************************************/
+/*                          PIPEWIRE AUDIO                                  */
+/****************************************************************************/
+
+func discoverPipeWireDevice() *audioState {
+	out, err := exec.Command("wpctl", "status").Output()
+	if err != nil {
+		return nil
+	}
+
+	var dongleName string
+	if dongle, exists := deviceManager[selectedDongle]; exists {
+		dongleName = dongle.deviceName
+	} else {
+		return nil
+	}
+
+	lines := strings.Split(string(out), "\n")
+	state := &audioState{deviceID: -1, sinkID: -1, sourceID: -1}
+
+	inAudio := false
+	subsection := "" // "devices", "sinks", "sources"
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Top-level section headers
+		if trimmed == "Audio" {
+			inAudio = true
+			subsection = ""
+			continue
+		}
+		if trimmed == "Video" || trimmed == "Settings" {
+			inAudio = false
+			continue
+		}
+		if !inAudio {
+			continue
+		}
+
+		// Sub-section headers (use exact suffixes to avoid "Sink endpoints:" matching "Sinks:")
+		stripped := strings.TrimLeft(trimmed, "│├└─ ")
+		switch {
+		case stripped == "Devices:":
+			subsection = "devices"
+			continue
+		case stripped == "Sinks:":
+			subsection = "sinks"
+			continue
+		case stripped == "Sources:":
+			subsection = "sources"
+			continue
+		case strings.HasSuffix(stripped, "endpoints:") || stripped == "Streams:" || stripped == "Filters:":
+			subsection = ""
+			continue
+		}
+
+		if subsection == "" || !strings.Contains(trimmed, dongleName) {
+			continue
+		}
+
+		id := parsePipeWireID(trimmed)
+		if id < 0 {
+			continue
+		}
+
+		switch subsection {
+		case "devices":
+			state.deviceID = id
+		case "sinks":
+			state.sinkID = id
+		case "sources":
+			state.sourceID = id
+		}
+	}
+
+	if state.deviceID < 0 {
+		return nil
+	}
+
+	return state
+}
+
+func parsePipeWireID(line string) int {
+	// Lines look like: "  *  49. Jabra Link 390 [vol: 1.00]"
+	// or "     49. Jabra Link 390 [vol: 1.00]"
+	cleaned := strings.TrimLeft(line, " *│├└─")
+	dotIdx := strings.Index(cleaned, ".")
+	if dotIdx < 0 {
+		return -1
+	}
+	numStr := strings.TrimSpace(cleaned[:dotIdx])
+	id, err := strconv.Atoi(numStr)
+	if err != nil {
+		return -1
+	}
+	return id
+}
+
+func getPipeWireProfiles(deviceID int) []audioProfile {
+	out, err := exec.Command("pw-cli", "enum-params", strconv.Itoa(deviceID), "EnumProfile").Output()
+	if err != nil {
+		return nil
+	}
+
+	var profiles []audioProfile
+	lines := strings.Split(string(out), "\n")
+	var current *audioProfile
+	expectField := "" // "index", "name", "description"
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		if strings.HasPrefix(trimmed, "Object:") {
+			if current != nil {
+				profiles = append(profiles, *current)
+			}
+			current = &audioProfile{}
+			expectField = ""
+			continue
+		}
+
+		if strings.Contains(trimmed, "Profile:index") {
+			expectField = "index"
+			continue
+		}
+		if strings.Contains(trimmed, "Profile:name") {
+			expectField = "name"
+			continue
+		}
+		if strings.Contains(trimmed, "Profile:description") {
+			expectField = "description"
+			continue
+		}
+
+		if current != nil && expectField != "" {
+			switch expectField {
+			case "index":
+				if strings.HasPrefix(trimmed, "Int ") {
+					val := strings.TrimPrefix(trimmed, "Int ")
+					current.index, _ = strconv.Atoi(val)
+				}
+			case "name":
+				if strings.HasPrefix(trimmed, "String ") {
+					current.name = strings.Trim(strings.TrimPrefix(trimmed, "String "), "\"")
+				}
+			case "description":
+				if strings.HasPrefix(trimmed, "String ") {
+					current.description = strings.Trim(strings.TrimPrefix(trimmed, "String "), "\"")
+				}
+			}
+			expectField = ""
+		}
+	}
+	if current != nil {
+		profiles = append(profiles, *current)
+	}
+
+	return profiles
+}
+
+func getActiveProfile(deviceID int) int {
+	out, err := exec.Command("pw-cli", "enum-params", strconv.Itoa(deviceID), "Profile").Output()
+	if err != nil {
+		return -1
+	}
+
+	expectIndex := false
+	for _, line := range strings.Split(string(out), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.Contains(trimmed, "Profile:index") {
+			expectIndex = true
+			continue
+		}
+		if expectIndex && strings.HasPrefix(trimmed, "Int ") {
+			val := strings.TrimPrefix(trimmed, "Int ")
+			idx, err := strconv.Atoi(val)
+			if err == nil {
+				return idx
+			}
+		}
+	}
+	return -1
+}
+
+func setAudioProfile(deviceID, index int) error {
+	return exec.Command("pw-cli", "set-param", strconv.Itoa(deviceID), "Profile",
+		fmt.Sprintf("{ index: %d }", index)).Run()
+}
+
+func getVolume(nodeID int) float64 {
+	out, err := exec.Command("wpctl", "get-volume", strconv.Itoa(nodeID)).Output()
+	if err != nil {
+		return -1
+	}
+	// Output: "Volume: 0.58" or "Volume: 0.58 [MUTED]"
+	parts := strings.Fields(string(out))
+	if len(parts) >= 2 {
+		vol, err := strconv.ParseFloat(parts[1], 64)
+		if err == nil {
+			return vol
+		}
+	}
+	return -1
+}
+
+func setVolume(nodeID int, vol float64) error {
+	if vol < 0 {
+		vol = 0
+	}
+	if vol > 1.5 {
+		vol = 1.5
+	}
+	return exec.Command("wpctl", "set-volume", strconv.Itoa(nodeID),
+		fmt.Sprintf("%.2f", vol)).Run()
+}
+
+func refreshAudioState() {
+	if currentAudioState == nil {
+		return
+	}
+	if currentAudioState.deviceID >= 0 {
+		currentAudioState.profiles = getPipeWireProfiles(currentAudioState.deviceID)
+		currentAudioState.activeProfile = getActiveProfile(currentAudioState.deviceID)
+	}
+	if currentAudioState.sinkID >= 0 {
+		currentAudioState.outputVolume = getVolume(currentAudioState.sinkID)
+	}
+	if currentAudioState.sourceID >= 0 {
+		currentAudioState.inputVolume = getVolume(currentAudioState.sourceID)
+	}
 }

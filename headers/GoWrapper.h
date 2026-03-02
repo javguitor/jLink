@@ -15,4 +15,6 @@ extern void deviceRemovedFunc(uint16_t deviceID);
 
 // extern void batteryStatusUpdate(unsigned short deviceID, Jabra_BatteryStatus* batteryStatus);
 
+extern void headDetectionStatusFunc(unsigned short deviceID, HeadDetectionStatus status);
+
 #endif

@@ -236,6 +236,12 @@ func startKeysPressedListener() {
 								updateHeadsetSettingsMenu()
 							}
 						}
+					case 3: // Busy Light toggle
+						if device, exists := deviceManager[selectedHeadset]; exists {
+							current := getBusyLightStatus(device.deviceID, device.featureFlags)
+							setBusyLightStatus(device.deviceID, !current, device.featureFlags)
+							updateHeadsetSettingsMenu()
+						}
 					}
 				}
 			}
@@ -244,6 +250,79 @@ func startKeysPressedListener() {
 			switch key {
 			case 'q':
 				startMenuSelected = -1
+			}
+		// ############# Audio Settings ##################
+		case 8:
+			switch key {
+			case 'q':
+				startMenuSelected = -1
+			case 'w':
+				handleUpKey()
+			case 's':
+				handleDownKey()
+			case '\r': // Enter on profile
+				if currentSelection == 0 && currentAudioState != nil && len(currentAudioState.profiles) > 0 {
+					nextIdx := -1
+					for i, p := range currentAudioState.profiles {
+						if p.index == currentAudioState.activeProfile {
+							nextIdx = (i + 1) % len(currentAudioState.profiles)
+							break
+						}
+					}
+					if nextIdx < 0 {
+						nextIdx = 0
+					}
+					setAudioProfile(currentAudioState.deviceID, currentAudioState.profiles[nextIdx].index)
+					// Re-discover after profile change (sink/source IDs may change)
+					currentAudioState = discoverPipeWireDevice()
+					refreshAudioState()
+				}
+			case 'a': // Decrease volume
+				if currentAudioState != nil {
+					switch currentSelection {
+					case 1:
+						if currentAudioState.sinkID >= 0 {
+							newVol := currentAudioState.outputVolume - 0.05
+							if newVol < 0 {
+								newVol = 0
+							}
+							setVolume(currentAudioState.sinkID, newVol)
+							currentAudioState.outputVolume = newVol
+						}
+					case 2:
+						if currentAudioState.sourceID >= 0 {
+							newVol := currentAudioState.inputVolume - 0.05
+							if newVol < 0 {
+								newVol = 0
+							}
+							setVolume(currentAudioState.sourceID, newVol)
+							currentAudioState.inputVolume = newVol
+						}
+					}
+				}
+			case 'd': // Increase volume
+				if currentAudioState != nil {
+					switch currentSelection {
+					case 1:
+						if currentAudioState.sinkID >= 0 {
+							newVol := currentAudioState.outputVolume + 0.05
+							if newVol > 1.5 {
+								newVol = 1.5
+							}
+							setVolume(currentAudioState.sinkID, newVol)
+							currentAudioState.outputVolume = newVol
+						}
+					case 2:
+						if currentAudioState.sourceID >= 0 {
+							newVol := currentAudioState.inputVolume + 0.05
+							if newVol > 1.5 {
+								newVol = 1.5
+							}
+							setVolume(currentAudioState.sourceID, newVol)
+							currentAudioState.inputVolume = newVol
+						}
+					}
+				}
 			}
 		// ############# Equalizer ##################
 		case 7:
@@ -318,6 +397,19 @@ func handleDownKey() {
 		}
 	case 7: // Equalizer
 		if currentSelection < len(equalizerBands)-1 {
+			currentSelection++
+		}
+	case 8: // Audio Settings
+		maxIdx := 0
+		if currentAudioState != nil {
+			if currentAudioState.sinkID >= 0 {
+				maxIdx = 1
+			}
+			if currentAudioState.sourceID >= 0 {
+				maxIdx = 2
+			}
+		}
+		if currentSelection < maxIdx {
 			currentSelection++
 		}
 	}
@@ -406,12 +498,31 @@ func header() {
 		strings.Repeat(batteryEmptyChar, emptySegments) +
 		"\033[0m" // Reset color
 
+	headIndicator := ""
+	if headset.featureFlags.onHeadDetection && headDetectionSet {
+		switch {
+		case headDetectionLeft && headDetectionRight:
+			headIndicator = " [Wearing]"
+		case headDetectionLeft || headDetectionRight:
+			l, r := "off", "off"
+			if headDetectionLeft {
+				l = "on"
+			}
+			if headDetectionRight {
+				r = "on"
+			}
+			headIndicator = fmt.Sprintf(" [L:%s R:%s]", l, r)
+		default:
+			headIndicator = " [Off-head]"
+		}
+	}
+
 	if headset.batteryStatus.charging {
-		moveCursor(2, width-50)
-		fmt.Printf("%s - Battery : [%s]🗲 %d%%", headset.deviceName, batteryBar, levelInPercent)
+		moveCursor(2, width-50-len(headIndicator))
+		fmt.Printf("%s - Battery : [%s]🗲 %d%%%s", headset.deviceName, batteryBar, levelInPercent, headIndicator)
 	} else {
-		moveCursor(2, width-48)
-		fmt.Printf("%s - Battery: [%s] %d%%", headset.deviceName, batteryBar, levelInPercent)
+		moveCursor(2, width-48-len(headIndicator))
+		fmt.Printf("%s - Battery: [%s] %d%%%s", headset.deviceName, batteryBar, levelInPercent, headIndicator)
 	}
 }
 
@@ -585,7 +696,15 @@ func buildDeviceInfoLines() []string {
 	if dongle, exists := deviceManager[selectedDongle]; exists {
 		lines = append(lines, fmt.Sprintf("--- %s ---", dongle.deviceName))
 		if fw := getFirmwareVersion(dongle.deviceID); fw != "" {
-			lines = append(lines, fmt.Sprintf("  Firmware:  %s", fw))
+			fwLine := fmt.Sprintf("  Firmware:  %s", fw)
+			if available, latestVer := checkFirmwareUpdate(dongle.deviceID); available && latestVer != "" {
+				fwLine += fmt.Sprintf(" -> %s available", latestVer)
+			} else if available {
+				fwLine += " (update available)"
+			} else {
+				fwLine += " (up to date)"
+			}
+			lines = append(lines, fwLine)
 		}
 		if esn := getESN(dongle.deviceID); esn != "" {
 			lines = append(lines, fmt.Sprintf("  ESN:       %s", esn))
@@ -599,7 +718,15 @@ func buildDeviceInfoLines() []string {
 	if headset, exists := deviceManager[selectedHeadset]; exists {
 		lines = append(lines, fmt.Sprintf("--- %s ---", headset.deviceName))
 		if fw := getFirmwareVersion(headset.deviceID); fw != "" {
-			lines = append(lines, fmt.Sprintf("  Firmware:  %s", fw))
+			fwLine := fmt.Sprintf("  Firmware:  %s", fw)
+			if available, latestVer := checkFirmwareUpdate(headset.deviceID); available && latestVer != "" {
+				fwLine += fmt.Sprintf(" -> %s available", latestVer)
+			} else if available {
+				fwLine += " (update available)"
+			} else {
+				fwLine += " (up to date)"
+			}
+			lines = append(lines, fwLine)
 		}
 		if esn := getESN(headset.deviceID); esn != "" {
 			lines = append(lines, fmt.Sprintf("  ESN:       %s", esn))
@@ -629,6 +756,95 @@ func deviceInfo() {
 
 	moveCursor(height-3, 7)
 	fmt.Println("\033[42m", "Q Back", "\033[0m")
+}
+
+func audioSettings() {
+	if !resetCurrentSelection {
+		currentSelection = 0
+		resetCurrentSelection = true
+		refreshAudioState()
+	}
+
+	drawingBox()
+
+	if currentAudioState == nil {
+		moveCursor(4, 8)
+		fmt.Print("No PipeWire audio device found")
+		moveCursor(height-3, 7)
+		fmt.Println("\033[42m", "Q Back", "\033[0m")
+		return
+	}
+
+	// Profile line
+	profileLabel := "Unknown"
+	for _, p := range currentAudioState.profiles {
+		if p.index == currentAudioState.activeProfile {
+			if p.description != "" {
+				profileLabel = p.description
+			} else {
+				profileLabel = p.name
+			}
+			break
+		}
+	}
+	moveCursor(4, 8)
+	label := fmt.Sprintf("Audio Profile: %s", profileLabel)
+	if currentSelection == 0 {
+		fmt.Printf("\033[42m %s \033[0m  (Enter)", label)
+	} else {
+		fmt.Printf(" %s   (Enter)", label)
+	}
+
+	// Output volume bar
+	if currentAudioState.sinkID >= 0 {
+		moveCursor(6, 8)
+		outPct := int(currentAudioState.outputVolume * 100)
+		if outPct > 150 {
+			outPct = 150
+		}
+		if outPct < 0 {
+			outPct = 0
+		}
+		filled := outPct / 5
+		if filled > 20 {
+			filled = 20
+		}
+		empty := 20 - filled
+		bar := strings.Repeat("\u2588", filled) + strings.Repeat("\u2591", empty)
+		volLabel := fmt.Sprintf("Output Volume: [%s] %3d%%", bar, outPct)
+		if currentSelection == 1 {
+			fmt.Printf("\033[42m %s \033[0m  (A/D)", volLabel)
+		} else {
+			fmt.Printf(" %s   (A/D)", volLabel)
+		}
+	}
+
+	// Input volume bar
+	if currentAudioState.sourceID >= 0 {
+		moveCursor(8, 8)
+		inPct := int(currentAudioState.inputVolume * 100)
+		if inPct > 150 {
+			inPct = 150
+		}
+		if inPct < 0 {
+			inPct = 0
+		}
+		filled := inPct / 5
+		if filled > 20 {
+			filled = 20
+		}
+		empty := 20 - filled
+		bar := strings.Repeat("\u2588", filled) + strings.Repeat("\u2591", empty)
+		volLabel := fmt.Sprintf("Input Volume:  [%s] %3d%%", bar, inPct)
+		if currentSelection == 2 {
+			fmt.Printf("\033[42m %s \033[0m  (A/D)", volLabel)
+		} else {
+			fmt.Printf(" %s   (A/D)", volLabel)
+		}
+	}
+
+	moveCursor(height-3, 7)
+	fmt.Println("\033[42m", "Q Back  A/D Adjust", "\033[0m")
 }
 
 func equalizerSettings() {
@@ -715,6 +931,12 @@ func startUi() {
 				case 6: // Device Info
 					menuState = 6
 					deviceInfo()
+				case 7: // Audio Settings
+					if menuState != 8 {
+						menuState = 8
+						resetCurrentSelection = false
+					}
+					audioSettings()
 				case 5: // Exit
 					return
 				}
