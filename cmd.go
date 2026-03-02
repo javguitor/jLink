@@ -45,6 +45,10 @@ var (
 
 	selectedItemsSearchForNewDevices = -1
 	menuItemsSearchForNewDevices     = [2]string{"Q Back", "1 Connect"}
+
+	// Headset settings & equalizer
+	equalizerBands  []equalizerBand
+	deviceInfoLines []string
 )
 
 const (
@@ -192,6 +196,96 @@ func startKeysPressedListener() {
 			case 'q': // Back To Start Menu
 				startMenuSelected = -1
 			}
+		// ############# Headset Settings ##################
+		case 5:
+			switch key {
+			case 'q':
+				startMenuSelected = -1
+			case 'w':
+				handleUpKey()
+			case 's':
+				handleDownKey()
+			case '\r':
+				if len(headsetSettingsMenu) > 0 {
+					switch headsetSettingsMenu[currentSelection].id {
+					case 0: // ANC Mode toggle
+						if device, exists := deviceManager[selectedHeadset]; exists {
+							supportedModes, err := getSupportedAmbienceModes(device.deviceID)
+							if err == nil && len(supportedModes) > 0 {
+								currentMode, _ := getAmbienceMode(device.deviceID)
+								nextIdx := 0
+								for i, m := range supportedModes {
+									if m == currentMode {
+										nextIdx = (i + 1) % len(supportedModes)
+										break
+									}
+								}
+								setAmbienceMode(device.deviceID, supportedModes[nextIdx])
+								updateHeadsetSettingsMenu()
+							}
+						}
+					case 1: // Equalizer
+						menuState = 7
+						resetCurrentSelection = false
+					case 2: // Sidetone toggle
+						if device, exists := deviceManager[selectedHeadset]; exists {
+							sidetone := findDeviceSetting(device.deviceID, "sidetone")
+							if sidetone != nil && len(sidetone.options) > 0 {
+								nextKey := (sidetone.current + 1) % len(sidetone.options)
+								setDeviceSetting(device.deviceID, sidetone.guid, nextKey)
+								updateHeadsetSettingsMenu()
+							}
+						}
+					}
+				}
+			}
+		// ############# Device Info ##################
+		case 6:
+			switch key {
+			case 'q':
+				startMenuSelected = -1
+			}
+		// ############# Equalizer ##################
+		case 7:
+			switch key {
+			case 'q':
+				menuState = 5
+				resetCurrentSelection = false
+			case 'w':
+				handleUpKey()
+			case 's':
+				handleDownKey()
+			case 'a': // Decrease gain
+				if len(equalizerBands) > 0 && currentSelection < len(equalizerBands) {
+					band := &equalizerBands[currentSelection]
+					newGain := band.currentGain - 1.0
+					if newGain >= -band.maxGain {
+						band.currentGain = newGain
+						if device, exists := deviceManager[selectedHeadset]; exists {
+							gains := make([]float32, len(equalizerBands))
+							for i, b := range equalizerBands {
+								gains[i] = b.currentGain
+							}
+							setEqualizerParameters(device.deviceID, gains)
+						}
+					}
+				}
+			case 'd': // Increase gain
+				if len(equalizerBands) > 0 && currentSelection < len(equalizerBands) {
+					band := &equalizerBands[currentSelection]
+					newGain := band.currentGain + 1.0
+					if newGain <= band.maxGain {
+						band.currentGain = newGain
+						if device, exists := deviceManager[selectedHeadset]; exists {
+							gains := make([]float32, len(equalizerBands))
+							for i, b := range equalizerBands {
+								gains[i] = b.currentGain
+							}
+							setEqualizerParameters(device.deviceID, gains)
+						}
+					}
+				}
+			}
 		}
 	}
 }
@@ -216,6 +310,14 @@ func handleDownKey() {
 		}
 	case 3: // Dongle Settings
 		if currentSelection < len(dongleSettignsMenu)-1 {
+			currentSelection++
+		}
+	case 5: // Headset Settings
+		if currentSelection < len(headsetSettingsMenu)-1 {
+			currentSelection++
+		}
+	case 7: // Equalizer
+		if currentSelection < len(equalizerBands)-1 {
 			currentSelection++
 		}
 	}
@@ -454,6 +556,125 @@ func dongleSettigns() {
 	fmt.Println("\033[42m", "Q Back", "\033[0m")
 }
 
+func headsetSettings() {
+	if !resetCurrentSelection {
+		currentSelection = 0
+		resetCurrentSelection = true
+		updateHeadsetSettingsMenu()
+	}
+
+	drawingBox()
+
+	for i, item := range headsetSettingsMenu {
+		if i == currentSelection {
+			moveCursor(4+i, 9)
+			fmt.Println("\033[42m", item.label, "\033[0m")
+		} else {
+			moveCursor(4+i, 10)
+			fmt.Println(item.label)
+		}
+	}
+
+	moveCursor(height-3, 7)
+	fmt.Println("\033[42m", "Q Back", "\033[0m")
+}
+
+func buildDeviceInfoLines() []string {
+	var lines []string
+
+	if dongle, exists := deviceManager[selectedDongle]; exists {
+		lines = append(lines, fmt.Sprintf("--- %s ---", dongle.deviceName))
+		if fw := getFirmwareVersion(dongle.deviceID); fw != "" {
+			lines = append(lines, fmt.Sprintf("  Firmware:  %s", fw))
+		}
+		if esn := getESN(dongle.deviceID); esn != "" {
+			lines = append(lines, fmt.Sprintf("  ESN:       %s", esn))
+		}
+		if sku := getSku(dongle.deviceID); sku != "" {
+			lines = append(lines, fmt.Sprintf("  SKU:       %s", sku))
+		}
+		lines = append(lines, "")
+	}
+
+	if headset, exists := deviceManager[selectedHeadset]; exists {
+		lines = append(lines, fmt.Sprintf("--- %s ---", headset.deviceName))
+		if fw := getFirmwareVersion(headset.deviceID); fw != "" {
+			lines = append(lines, fmt.Sprintf("  Firmware:  %s", fw))
+		}
+		if esn := getESN(headset.deviceID); esn != "" {
+			lines = append(lines, fmt.Sprintf("  ESN:       %s", esn))
+		}
+		lines = append(lines, fmt.Sprintf("  Serial:    %s", headset.serialNumber))
+		if headset.batteryStatus != nil {
+			lines = append(lines, fmt.Sprintf("  Battery:   %d%%", headset.batteryStatus.levelInPercent))
+		}
+		lines = append(lines, "")
+	}
+
+	return lines
+}
+
+func deviceInfo() {
+	if !resetCurrentSelection {
+		resetCurrentSelection = true
+		deviceInfoLines = buildDeviceInfoLines()
+	}
+
+	drawingBox()
+
+	for i, line := range deviceInfoLines {
+		moveCursor(4+i, 8)
+		fmt.Print(line)
+	}
+
+	moveCursor(height-3, 7)
+	fmt.Println("\033[42m", "Q Back", "\033[0m")
+}
+
+func equalizerSettings() {
+	if !resetCurrentSelection {
+		currentSelection = 0
+		resetCurrentSelection = true
+		if device, exists := deviceManager[selectedHeadset]; exists {
+			bands, err := getEqualizerParameters(device.deviceID)
+			if err == nil {
+				equalizerBands = bands
+			}
+		}
+	}
+
+	drawingBox()
+
+	for i, band := range equalizerBands {
+		moveCursor(4+i, 8)
+
+		freqLabel := fmt.Sprintf("%5d Hz", band.centerFrequency)
+
+		const barWidth = 20
+		normalized := (band.currentGain + band.maxGain) / (2 * band.maxGain)
+		if normalized < 0 {
+			normalized = 0
+		}
+		if normalized > 1 {
+			normalized = 1
+		}
+		filled := int(normalized * barWidth)
+		empty := barWidth - filled
+		bar := strings.Repeat("█", filled) + strings.Repeat("░", empty)
+
+		gainLabel := fmt.Sprintf("%+.1f dB", band.currentGain)
+
+		if i == currentSelection {
+			fmt.Printf("\033[42m %s  [%s]  %s \033[0m", freqLabel, bar, gainLabel)
+		} else {
+			fmt.Printf(" %s  [%s]  %s", freqLabel, bar, gainLabel)
+		}
+	}
+
+	moveCursor(height-3, 7)
+	fmt.Println("\033[42m", "Q Back  A/D Adjust", "\033[0m")
+}
+
 func startUi() {
 	sigChan := make(chan os.Signal, 1)
 	go func() {
@@ -485,7 +706,15 @@ func startUi() {
 					fmt.Println("Switch Device")
 					menuState = 4
 				case 4: // HeadSet Settings
-					fmt.Println("HeadSet Settings")
+					if menuState == 7 {
+						equalizerSettings()
+					} else {
+						menuState = 5
+						headsetSettings()
+					}
+				case 6: // Device Info
+					menuState = 6
+					deviceInfo()
 				case 5: // Exit
 					return
 				}

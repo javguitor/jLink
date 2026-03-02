@@ -6,12 +6,15 @@ package main
 
 #include "Common.h"
 #include "JabraDeviceConfig.h"
+#include "Interface_AmbienceModes.h"
+#include "Interface_Firmware.h"
 #include <stdlib.h>
 */
 import "C"
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
 	"unsafe"
 )
@@ -200,6 +203,19 @@ type menuItem struct {
 	label string
 }
 
+type equalizerBand struct {
+	maxGain         float32
+	centerFrequency int
+	currentGain     float32
+}
+
+type deviceSetting struct {
+	guid    string
+	name    string
+	current int
+	options []string
+}
+
 var (
 	// deviceManager
 	deviceManager   devices
@@ -207,8 +223,9 @@ var (
 	selectedDongle  int = -1
 
 	// Dynamic menu
-	startMenu          = []menuItem{}
-	dongleSettignsMenu = []menuItem{}
+	startMenu           = []menuItem{}
+	dongleSettignsMenu  = []menuItem{}
+	headsetSettingsMenu = []menuItem{}
 
 	// holding all the new devide found on BT
 	searchDeviceList *pairingList = &pairingList{
@@ -409,9 +426,13 @@ func updateStartMenu() {
 	// 	startMenu = append(startMenu, menuItem{id: 3, label: "Switch Device"})
 	// }
 
-	// if device, deviceexists := deviceManager[selectedHeadset]; deviceexists {
-	// 	startMenu = append(startMenu, menuItem{id: 4, label: fmt.Sprintf("%s Settings", device.deviceName)})
-	// }
+	if device, deviceexists := deviceManager[selectedHeadset]; deviceexists {
+		startMenu = append(startMenu, menuItem{id: 4, label: fmt.Sprintf("%s Settings", device.deviceName)})
+	}
+
+	if len(deviceManager) > 0 {
+		startMenu = append(startMenu, menuItem{id: 6, label: "Device Info"})
+	}
 
 	startMenu = append(startMenu, menuItem{id: 5, label: "Exit"})
 
@@ -1000,4 +1021,203 @@ func getBatteryStatus(deviceID uint16) (*batteryStatus, error) {
 	C.Jabra_FreeBatteryStatus(cBatteryStatus)
 
 	return goBatteryStatus, nil
+}
+
+/****************************************************************************/
+/*                            HEADSET SETTINGS                              */
+/****************************************************************************/
+
+func updateHeadsetSettingsMenu() {
+	headsetSettingsMenu = []menuItem{}
+
+	device, exists := deviceManager[selectedHeadset]
+	if !exists {
+		return
+	}
+
+	if device.featureFlags.ambienceModes {
+		mode, err := getAmbienceMode(device.deviceID)
+		modeLabel := "ANC Mode: OFF"
+		if err == nil {
+			switch mode {
+			case 1:
+				modeLabel = "ANC Mode: HearThrough"
+			case 2:
+				modeLabel = "ANC Mode: ANC"
+			}
+		}
+		headsetSettingsMenu = append(headsetSettingsMenu, menuItem{id: 0, label: modeLabel})
+	}
+
+	if device.featureFlags.musicEqualizer && isEqualizerSupported(device.deviceID) {
+		headsetSettingsMenu = append(headsetSettingsMenu, menuItem{id: 1, label: "Equalizer"})
+	}
+
+	sidetone := findDeviceSetting(device.deviceID, "sidetone")
+	if sidetone != nil && len(sidetone.options) > 0 {
+		currentLabel := "Unknown"
+		if sidetone.current >= 0 && sidetone.current < len(sidetone.options) {
+			currentLabel = sidetone.options[sidetone.current]
+		}
+		headsetSettingsMenu = append(headsetSettingsMenu, menuItem{id: 2, label: fmt.Sprintf("Sidetone: %s", currentLabel)})
+	}
+}
+
+/****************************************************************************/
+/*                           AMBIENCE MODES (ANC)                           */
+/****************************************************************************/
+
+func getAmbienceMode(deviceID uint16) (int, error) {
+	var mode C.Jabra_AmbienceMode
+	if err := returnCode(int(C.Jabra_GetAmbienceMode(C.ushort(deviceID), &mode))); err != nil {
+		return 0, err
+	}
+	return int(mode), nil
+}
+
+func setAmbienceMode(deviceID uint16, mode int) error {
+	return returnCode(int(C.Jabra_SetAmbienceMode(C.ushort(deviceID), C.Jabra_AmbienceMode(mode))))
+}
+
+func getSupportedAmbienceModes(deviceID uint16) ([]int, error) {
+	var length C.size_t = 10
+	modes := make([]C.Jabra_AmbienceMode, length)
+	if err := returnCode(int(C.Jabra_GetSupportedAmbienceModes(C.ushort(deviceID), &modes[0], &length))); err != nil {
+		return nil, err
+	}
+	result := make([]int, int(length))
+	for i := 0; i < int(length); i++ {
+		result[i] = int(modes[i])
+	}
+	return result, nil
+}
+
+/****************************************************************************/
+/*                               EQUALIZER                                  */
+/****************************************************************************/
+
+func isEqualizerSupported(deviceID uint16) bool {
+	return bool(C.Jabra_IsEqualizerSupported(C.ushort(deviceID)))
+}
+
+func getEqualizerParameters(deviceID uint16) ([]equalizerBand, error) {
+	var nbands C.uint = 10
+	bands := make([]C.Jabra_EqualizerBand, nbands)
+	if err := returnCode(int(C.Jabra_GetEqualizerParameters(C.ushort(deviceID), &bands[0], &nbands))); err != nil {
+		return nil, err
+	}
+	result := make([]equalizerBand, int(nbands))
+	for i := 0; i < int(nbands); i++ {
+		result[i] = equalizerBand{
+			maxGain:         float32(bands[i].max_gain),
+			centerFrequency: int(bands[i].centerFrequency),
+			currentGain:     float32(bands[i].currentGain),
+		}
+	}
+	return result, nil
+}
+
+func setEqualizerParameters(deviceID uint16, gains []float32) error {
+	cGains := make([]C.float, len(gains))
+	for i, g := range gains {
+		cGains[i] = C.float(g)
+	}
+	return returnCode(int(C.Jabra_SetEqualizerParameters(C.ushort(deviceID), &cGains[0], C.uint(len(cGains)))))
+}
+
+/****************************************************************************/
+/*                             DEVICE INFO                                  */
+/****************************************************************************/
+
+func getFirmwareVersion(deviceID uint16) string {
+	const bufferSize = 64
+	buffer := make([]byte, bufferSize)
+	cBuffer := (*C.char)(unsafe.Pointer(&buffer[0]))
+	if err := returnCode(int(C.Jabra_GetFirmwareVersion(C.ushort(deviceID), cBuffer, C.int(bufferSize)))); err != nil {
+		return ""
+	}
+	return C.GoString(cBuffer)
+}
+
+func getESN(deviceID uint16) string {
+	const bufferSize = 64
+	buffer := make([]byte, bufferSize)
+	cBuffer := (*C.char)(unsafe.Pointer(&buffer[0]))
+	if err := returnCode(int(C.Jabra_GetESN(C.ushort(deviceID), cBuffer, C.int(bufferSize)))); err != nil {
+		return ""
+	}
+	return C.GoString(cBuffer)
+}
+
+func getSku(deviceID uint16) string {
+	const bufferSize = 64
+	buffer := make([]byte, bufferSize)
+	cBuffer := (*C.char)(unsafe.Pointer(&buffer[0]))
+	if err := returnCode(int(C.Jabra_GetSku(C.ushort(deviceID), cBuffer, C.uint(bufferSize)))); err != nil {
+		return ""
+	}
+	return C.GoString(cBuffer)
+}
+
+/****************************************************************************/
+/*                          DEVICE SETTINGS (Generic)                       */
+/****************************************************************************/
+
+func findDeviceSetting(deviceID uint16, name string) *deviceSetting {
+	cSettings := C.Jabra_GetSettings(C.ushort(deviceID))
+	if cSettings == nil {
+		return nil
+	}
+	defer C.Jabra_FreeDeviceSettings(cSettings)
+
+	settingsArr := (*[1 << 30]C.SettingInfo)(unsafe.Pointer(cSettings.settingInfo))[:cSettings.settingCount:cSettings.settingCount]
+
+	for _, s := range settingsArr {
+		settingName := C.GoString(s.name)
+		if !strings.Contains(strings.ToLower(settingName), strings.ToLower(name)) {
+			continue
+		}
+
+		ds := &deviceSetting{
+			guid: C.GoString(s.guid),
+			name: settingName,
+		}
+
+		if s.settingDataType == C.settingByte && s.currValue != nil {
+			ds.current = int(*(*C.ushort)(s.currValue))
+		}
+
+		if s.listSize > 0 && s.listKeyValue != nil {
+			kvArr := (*[1 << 30]C.ListKeyValue)(unsafe.Pointer(s.listKeyValue))[:s.listSize:s.listSize]
+			ds.options = make([]string, 0, s.listSize)
+			for _, kv := range kvArr {
+				ds.options = append(ds.options, C.GoString(kv.value))
+			}
+		}
+
+		return ds
+	}
+
+	return nil
+}
+
+func setDeviceSetting(deviceID uint16, guid string, key int) error {
+	cGuid := C.CString(guid)
+	defer C.free(unsafe.Pointer(cGuid))
+
+	cSettings := C.Jabra_GetSetting(C.ushort(deviceID), cGuid)
+	if cSettings == nil {
+		return fmt.Errorf("setting not found")
+	}
+
+	if cSettings.settingCount > 0 {
+		settingsArr := (*[1 << 30]C.SettingInfo)(unsafe.Pointer(cSettings.settingInfo))[:1:1]
+		if settingsArr[0].settingDataType == C.settingByte && settingsArr[0].currValue != nil {
+			*(*C.ushort)(settingsArr[0].currValue) = C.ushort(key)
+		}
+	}
+
+	err := returnCode(int(C.Jabra_SetSettings(C.ushort(deviceID), cSettings)))
+	C.Jabra_FreeDeviceSettings(cSettings)
+	return err
 }
