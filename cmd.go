@@ -237,6 +237,32 @@ func startKeysPressedListener() {
 			switch key {
 			case 'q':
 				startMenuSelected = -1
+				fwUpdatesAvailable = nil
+			case 'w':
+				handleUpKey()
+			case 's':
+				handleDownKey()
+			case '\r':
+				if len(fwUpdatesAvailable) > 0 && currentSelection >= 0 && currentSelection < len(fwUpdatesAvailable) {
+					fwa := fwUpdatesAvailable[currentSelection]
+					go startFirmwareDownload(fwa.deviceID, fwa.version)
+					menuState = 10
+					resetCurrentSelection = false
+				}
+			}
+		// ############# Firmware Update ##################
+		case 10:
+			switch key {
+			case 'q':
+				if fwUpdateState != nil && (fwUpdateState.phase == fwPhaseCompleted || fwUpdateState.phase == fwPhaseError || fwUpdateState.phase == fwPhaseCancelled) {
+					fwUpdateState = nil
+					menuState = 6
+					resetCurrentSelection = false
+				}
+			case 'c':
+				if fwUpdateState != nil && fwUpdateState.phase == fwPhaseDownload {
+					cancelFirmwareDownload(fwUpdateState.deviceID)
+				}
 			}
 		// ############# Audio Settings ##################
 		case 8:
@@ -460,6 +486,10 @@ func handleDownKey() {
 		}
 	case 5: // Headset Settings
 		if currentSelection < len(headsetSettingsMenu)-1 {
+			currentSelection++
+		}
+	case 6: // Device Info
+		if len(fwUpdatesAvailable) > 0 && currentSelection < len(fwUpdatesAvailable)-1 {
 			currentSelection++
 		}
 	case 7: // Equalizer
@@ -788,8 +818,9 @@ func headsetSettings() {
 	fmt.Println("\033[42m", "Q Back", "\033[0m")
 }
 
-func buildDeviceInfoLines() []string {
+func buildDeviceInfoLines() ([]string, []fwUpdateAvailability) {
 	var lines []string
+	var fwActions []fwUpdateAvailability
 
 	if dongle, exists := deviceManager[selectedDongle]; exists {
 		lines = append(lines, fmt.Sprintf("--- %s ---", dongle.deviceName))
@@ -797,12 +828,22 @@ func buildDeviceInfoLines() []string {
 			fwLine := fmt.Sprintf("  Firmware:  %s", fw)
 			if available, latestVer := checkFirmwareUpdate(dongle.deviceID); available && latestVer != "" {
 				fwLine += fmt.Sprintf(" -> %s available", latestVer)
+				lines = append(lines, fwLine)
+				actionLine := fmt.Sprintf("     >> Download & Update to %s", latestVer)
+				fwActions = append(fwActions, fwUpdateAvailability{
+					deviceID:   dongle.deviceID,
+					deviceName: dongle.deviceName,
+					version:    latestVer,
+					lineIndex:  len(lines),
+				})
+				lines = append(lines, actionLine)
 			} else if available {
 				fwLine += " (update available)"
+				lines = append(lines, fwLine)
 			} else {
 				fwLine += " (up to date)"
+				lines = append(lines, fwLine)
 			}
-			lines = append(lines, fwLine)
 		}
 		if esn := getESN(dongle.deviceID); esn != "" {
 			lines = append(lines, fmt.Sprintf("  ESN:       %s", esn))
@@ -827,12 +868,22 @@ func buildDeviceInfoLines() []string {
 			fwLine := fmt.Sprintf("  Firmware:  %s", fw)
 			if available, latestVer := checkFirmwareUpdate(headset.deviceID); available && latestVer != "" {
 				fwLine += fmt.Sprintf(" -> %s available", latestVer)
+				lines = append(lines, fwLine)
+				actionLine := fmt.Sprintf("     >> Download & Update to %s", latestVer)
+				fwActions = append(fwActions, fwUpdateAvailability{
+					deviceID:   headset.deviceID,
+					deviceName: headset.deviceName,
+					version:    latestVer,
+					lineIndex:  len(lines),
+				})
+				lines = append(lines, actionLine)
 			} else if available {
 				fwLine += " (update available)"
+				lines = append(lines, fwLine)
 			} else {
 				fwLine += " (up to date)"
+				lines = append(lines, fwLine)
 			}
-			lines = append(lines, fwLine)
 		}
 		if esn := getESN(headset.deviceID); esn != "" {
 			lines = append(lines, fmt.Sprintf("  ESN:       %s", esn))
@@ -846,24 +897,56 @@ func buildDeviceInfoLines() []string {
 		lines = append(lines, "")
 	}
 
-	return lines
+	return lines, fwActions
 }
 
 func deviceInfo() {
 	if !resetCurrentSelection {
+		currentSelection = 0
 		resetCurrentSelection = true
-		deviceInfoLines = buildDeviceInfoLines()
+		var fwActions []fwUpdateAvailability
+		deviceInfoLines, fwActions = buildDeviceInfoLines()
+		fwUpdatesAvailable = fwActions
 	}
 
 	drawingBox()
 
 	for i, line := range deviceInfoLines {
-		moveCursor(4+i, 8)
-		fmt.Print(line)
+		isAction := false
+		for _, fwa := range fwUpdatesAvailable {
+			if fwa.lineIndex == i {
+				isAction = true
+				break
+			}
+		}
+		if isAction {
+			// Find which action index this is
+			actionIdx := -1
+			for j, fwa := range fwUpdatesAvailable {
+				if fwa.lineIndex == i {
+					actionIdx = j
+					break
+				}
+			}
+			if actionIdx == currentSelection {
+				moveCursor(4+i, 7)
+				fmt.Printf("\033[42m %s \033[0m", line)
+			} else {
+				moveCursor(4+i, 8)
+				fmt.Printf("\033[33m%s\033[0m", line)
+			}
+		} else {
+			moveCursor(4+i, 8)
+			fmt.Print(line)
+		}
 	}
 
+	footer := "Q Back"
+	if len(fwUpdatesAvailable) > 0 {
+		footer = "Q Back  W/S Navigate  Enter Update"
+	}
 	moveCursor(height-3, 7)
-	fmt.Println("\033[42m", "Q Back", "\033[0m")
+	fmt.Printf("\033[42m %s \033[0m", footer)
 }
 
 func audioSettings() {
@@ -999,6 +1082,65 @@ func equalizerSettings() {
 	fmt.Println("\033[42m", "Q Back  A/D Adjust", "\033[0m")
 }
 
+func firmwareUpdateScreen() {
+	drawingBox()
+
+	if fwUpdateState == nil {
+		moveCursor(4, 8)
+		fmt.Print("No firmware update in progress")
+		moveCursor(height-3, 7)
+		fmt.Println("\033[42m", "Q Back", "\033[0m")
+		return
+	}
+
+	moveCursor(4, 8)
+	fmt.Printf("Firmware Update: %s", fwUpdateState.deviceName)
+	moveCursor(5, 8)
+	fmt.Printf("Target version: %s", fwUpdateState.version)
+
+	moveCursor(7, 8)
+	phaseLabel := "IDLE"
+	switch fwUpdateState.phase {
+	case fwPhaseDownload:
+		phaseLabel = "DOWNLOAD"
+	case fwPhaseUpdate:
+		phaseLabel = "UPDATE"
+	case fwPhaseCompleted:
+		phaseLabel = "COMPLETED"
+	case fwPhaseCancelled:
+		phaseLabel = "CANCELLED"
+	case fwPhaseError:
+		phaseLabel = "ERROR"
+	}
+	fmt.Printf("Phase: %s", phaseLabel)
+
+	// Progress bar
+	moveCursor(9, 8)
+	const barWidth = 30
+	filled := fwUpdateState.percentage * barWidth / 100
+	if filled > barWidth {
+		filled = barWidth
+	}
+	empty := barWidth - filled
+	bar := strings.Repeat("\u2588", filled) + strings.Repeat("\u2591", empty)
+	fmt.Printf("[%s]  %d%%", bar, fwUpdateState.percentage)
+
+	moveCursor(11, 8)
+	fmt.Print(fwUpdateState.statusMsg)
+
+	moveCursor(height-3, 7)
+	switch fwUpdateState.phase {
+	case fwPhaseDownload:
+		fmt.Println("\033[42m", "C Cancel", "\033[0m")
+	case fwPhaseUpdate:
+		fmt.Println("\033[43m", "Updating... please wait", "\033[0m")
+	case fwPhaseCompleted, fwPhaseError, fwPhaseCancelled:
+		fmt.Println("\033[42m", "Q Back", "\033[0m")
+	default:
+		fmt.Println("\033[42m", "Please wait...", "\033[0m")
+	}
+}
+
 func ancSettings() {
 	if !resetCurrentSelection {
 		currentSelection = 0
@@ -1129,8 +1271,12 @@ func startUi() {
 						headsetSettings()
 					}
 				case 6: // Device Info
-					menuState = 6
-					deviceInfo()
+					if menuState == 10 {
+						firmwareUpdateScreen()
+					} else {
+						menuState = 6
+						deviceInfo()
+					}
 				case 7: // Audio Settings
 					if menuState != 8 {
 						menuState = 8

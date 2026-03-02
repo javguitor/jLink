@@ -45,6 +45,7 @@ func main() {
 		log.Fatalln("Failed to initialize Jabra SDK")
 	}
 	defer uninitialize()
+	registerFirmwareProgressCallback()
 
 	// The current callback behavior is inconsistent. While the charging status updates as expected,
 	// the `levelInPercent` callback is sometimes delayed. This causes issues with timely updates.

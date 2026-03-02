@@ -2,6 +2,7 @@
 #define WRAPPER_H
 
 #include "Common.h"
+#include "Interface_Firmware.h"
 #include "Interface_Bluetooth.h"
 
 // extern void firstScanForDevicesDone(void);
@@ -17,6 +18,11 @@ extern void deviceRemovedFunc(uint16_t deviceID);
 // extern void batteryStatusUpdate(unsigned short deviceID, Jabra_BatteryStatus* batteryStatus);
 
 extern void headDetectionStatusFunc(unsigned short deviceID, HeadDetectionStatus status);
+
+extern void firmwareProgressFunc(unsigned short deviceID,
+    Jabra_FirmwareEventType type,
+    Jabra_FirmwareEventStatus status,
+    unsigned short percentage);
 
 extern void linkQualityStatusFunc(unsigned short deviceID, const LinkQuality status);
 

@@ -1450,6 +1450,167 @@ func getSku(deviceID uint16) string {
 	return C.GoString(cBuffer)
 }
 
+type fwUpdatePhase int
+
+const (
+	fwPhaseIdle fwUpdatePhase = iota
+	fwPhaseDownload
+	fwPhaseUpdate
+	fwPhaseCompleted
+	fwPhaseCancelled
+	fwPhaseError
+)
+
+type firmwareUpdateState struct {
+	deviceID   uint16
+	deviceName string
+	version    string
+	phase      fwUpdatePhase
+	percentage int
+	statusMsg  string
+	errorMsg   string
+}
+
+var fwUpdateState *firmwareUpdateState
+
+type fwUpdateAvailability struct {
+	deviceID   uint16
+	deviceName string
+	version    string
+	lineIndex  int
+}
+
+var fwUpdatesAvailable []fwUpdateAvailability
+
+//export firmwareProgressFunc
+func firmwareProgressFunc(deviceID C.ushort, eventType C.Jabra_FirmwareEventType, status C.Jabra_FirmwareEventStatus, percentage C.ushort) {
+	if fwUpdateState == nil {
+		return
+	}
+
+	switch eventType {
+	case C.Firmware_Download:
+		fwUpdateState.phase = fwPhaseDownload
+	case C.Firmware_Update:
+		fwUpdateState.phase = fwPhaseUpdate
+	}
+
+	fwUpdateState.percentage = int(percentage)
+
+	switch status {
+	case C.Initiating:
+		fwUpdateState.statusMsg = "Initiating..."
+	case C.InProgress:
+		if eventType == C.Firmware_Download {
+			fwUpdateState.statusMsg = fmt.Sprintf("Downloading... %d%%", int(percentage))
+		} else {
+			fwUpdateState.statusMsg = fmt.Sprintf("Updating... %d%%", int(percentage))
+		}
+	case C.Completed:
+		if eventType == C.Firmware_Download {
+			fwUpdateState.statusMsg = "Download complete, starting update..."
+			go startFirmwareUpdate(fwUpdateState.deviceID, fwUpdateState.version)
+		} else {
+			fwUpdateState.phase = fwPhaseCompleted
+			fwUpdateState.statusMsg = "Firmware update completed!"
+		}
+	case C.Cancelled:
+		fwUpdateState.phase = fwPhaseCancelled
+		fwUpdateState.statusMsg = "Cancelled"
+	default:
+		fwUpdateState.phase = fwPhaseError
+		fwUpdateState.errorMsg = firmwareEventStatusToString(int(status))
+		fwUpdateState.statusMsg = fwUpdateState.errorMsg
+	}
+}
+
+func firmwareEventStatusToString(status int) string {
+	switch status {
+	case 4:
+		return "File not available"
+	case 5:
+		return "File not accessible"
+	case 6:
+		return "File already present"
+	case 7:
+		return "Network error"
+	case 8:
+		return "SSL error"
+	case 9:
+		return "Download error"
+	case 10:
+		return "Update error"
+	case 11:
+		return "Invalid authentication"
+	case 12:
+		return "File under download"
+	case 13:
+		return "Not allowed"
+	case 14:
+		return "SDK too old for update"
+	default:
+		return fmt.Sprintf("Unknown error (%d)", status)
+	}
+}
+
+func registerFirmwareProgressCallback() {
+	C.Jabra_RegisterFirmwareProgressCallBack((*[0]byte)(C.firmwareProgressFunc))
+}
+
+func startFirmwareDownload(deviceID uint16, version string) {
+	fwUpdateState = &firmwareUpdateState{
+		deviceID:  deviceID,
+		version:   version,
+		phase:     fwPhaseDownload,
+		statusMsg: "Starting download...",
+	}
+	if device, exists := deviceManager[selectedDongle]; exists && device.deviceID == deviceID {
+		fwUpdateState.deviceName = device.deviceName
+	} else if device, exists := deviceManager[selectedHeadset]; exists && device.deviceID == deviceID {
+		fwUpdateState.deviceName = device.deviceName
+	}
+
+	cVersion := C.CString(version)
+	defer C.free(unsafe.Pointer(cVersion))
+	rc := returnCode(int(C.Jabra_DownloadFirmware(C.ushort(deviceID), cVersion, nil)))
+	if rc != nil {
+		// Return_Async (29) is expected for async operation
+		rcStr := rc.Error()
+		if rcStr != "Return_Async" {
+			fwUpdateState.phase = fwPhaseError
+			fwUpdateState.errorMsg = rcStr
+			fwUpdateState.statusMsg = rcStr
+		}
+	}
+}
+
+func startFirmwareUpdate(deviceID uint16, version string) {
+	cVersion := C.CString(version)
+	filePath := C.Jabra_GetFirmwareFilePath(C.ushort(deviceID), cVersion)
+	C.free(unsafe.Pointer(cVersion))
+	if filePath == nil {
+		fwUpdateState.phase = fwPhaseError
+		fwUpdateState.errorMsg = "Could not get firmware file path"
+		fwUpdateState.statusMsg = fwUpdateState.errorMsg
+		return
+	}
+	defer C.Jabra_FreeString(filePath)
+
+	rc := returnCode(int(C.Jabra_UpdateFirmware(C.ushort(deviceID), filePath)))
+	if rc != nil {
+		rcStr := rc.Error()
+		if rcStr != "Return_Async" {
+			fwUpdateState.phase = fwPhaseError
+			fwUpdateState.errorMsg = rcStr
+			fwUpdateState.statusMsg = rcStr
+		}
+	}
+}
+
+func cancelFirmwareDownload(deviceID uint16) error {
+	return returnCode(int(C.Jabra_CancelFirmwareDownload(C.ushort(deviceID))))
+}
+
 /****************************************************************************/
 /*                          DEVICE SETTINGS (Generic)                       */
 /****************************************************************************/
