@@ -20,7 +20,6 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"time"
 	"unsafe"
 )
 
@@ -221,6 +220,11 @@ type deviceSetting struct {
 	options []string
 }
 
+type firmwareProgressEvent struct {
+	deviceID                      uint16
+	eventType, status, percentage int
+}
+
 var (
 	// deviceManager
 	deviceManager   devices
@@ -239,9 +243,13 @@ var (
 		pairedDevices: make([]pairedDevice, 0),
 	}
 
-	// Stop Channels
-	stopUpdateBattery     = make(chan struct{})
-	stopUpdatePairingList = make(chan struct{})
+	// Notification channels for C callbacks -> Bubbletea
+	// firmwareProgressEvent carries data from the C firmware callback to Bubbletea
+	chDeviceAttached   = make(chan *jabra_DeviceInfo, 4)
+	chDeviceRemoved    = make(chan uint16, 4)
+	chHeadDetection    = make(chan [2]bool, 4)
+	chLinkQuality      = make(chan int, 4)
+	chFirmwareProgress = make(chan firmwareProgressEvent, 8)
 
 	// Head detection state
 	headDetectionLeft  bool
@@ -307,9 +315,7 @@ func deviceAttachedFunc(deviceInfo C.Jabra_DeviceInfo) {
 
 	if !goDeviceInfo.isDongle {
 		battery, err := getBatteryStatus(goDeviceInfo.deviceID)
-		if err != nil {
-			fmt.Printf("Get Battery Status for %s: %s\n", goDeviceInfo.deviceName, err)
-		} else {
+		if err == nil {
 			goDeviceInfo.batteryStatus = battery
 		}
 		if goDeviceInfo.featureFlags.onHeadDetection {
@@ -333,11 +339,21 @@ func deviceAttachedFunc(deviceInfo C.Jabra_DeviceInfo) {
 		deviceManager.add(goDeviceInfo)
 	}
 	C.Jabra_FreeDeviceInfo(deviceInfo)
+
+	select {
+	case chDeviceAttached <- goDeviceInfo:
+	default:
+	}
 }
 
 //export deviceRemovedFunc
 func deviceRemovedFunc(deviceID uint16) {
 	deviceManager.removed(deviceID)
+
+	select {
+	case chDeviceRemoved <- deviceID:
+	default:
+	}
 }
 
 //export headDetectionStatusFunc
@@ -345,12 +361,22 @@ func headDetectionStatusFunc(deviceID C.ushort, status C.HeadDetectionStatus) {
 	headDetectionLeft = bool(status.leftOn)
 	headDetectionRight = bool(status.rightOn)
 	headDetectionSet = true
+
+	select {
+	case chHeadDetection <- [2]bool{headDetectionLeft, headDetectionRight}:
+	default:
+	}
 }
 
 //export linkQualityStatusFunc
 func linkQualityStatusFunc(deviceID C.ushort, status C.LinkQuality) {
 	linkQualityStatus = int(status)
 	linkQualitySet = true
+
+	select {
+	case chLinkQuality <- linkQualityStatus:
+	default:
+	}
 }
 
 // //export buttonInDataRawHidFunc
@@ -367,52 +393,6 @@ func linkQualityStatusFunc(deviceID C.ushort, status C.LinkQuality) {
 // 	// }
 // }
 
-func updatePairingList() {
-
-	for {
-		select {
-		case <-stopUpdatePairingList:
-			return
-		default:
-			if dongle, exists := deviceManager[selectedDongle]; exists {
-				updatePairingList := getPairingList(dongle.deviceID)
-				dongle.pairingList.count = updatePairingList.count
-				dongle.pairingList.listType = updatePairingList.listType
-				dongle.pairingList.pairedDevices = updatePairingList.pairedDevices
-
-			}
-			time.Sleep(time.Second)
-		}
-	}
-
-}
-
-func batteryStatusUpdate() {
-	for {
-		select {
-		case <-stopUpdateBattery:
-			return
-		default:
-			if device, exists := deviceManager[selectedHeadset]; exists {
-				battery, err := getBatteryStatus(device.deviceID)
-				if err != nil {
-					fmt.Println("Error getBatteryStatus")
-					return
-				}
-				// Note: The battery percentage increases by a certain amount when charging (e.g., from 83% to 90%).
-				// The exact reason for this behavior is unclear but might be related to factors like the battery's charge cycle or charging efficiency.
-				device.batteryStatus.levelInPercent = battery.levelInPercent
-				device.batteryStatus.charging = battery.charging
-				device.batteryStatus.batteryLow = battery.batteryLow
-				device.batteryStatus.component = battery.component
-				device.batteryStatus.extraUnitsCount = battery.extraUnitsCount
-				device.batteryStatus.extraUnits = battery.extraUnits
-			}
-			time.Sleep(time.Second)
-		}
-	}
-
-}
 
 // Reminder: If you plan to use this function, make sure to update the `goWrapper.h` file accordingly.
 // The current callback behavior is inconsistent. While the charging status updates as expected,
@@ -467,28 +447,25 @@ func updateDongleSettignsMenu() {
 	}
 }
 
+// menuItem id=-1 is a non-selectable separator/section header
 func updateStartMenu() {
 	startMenu = []menuItem{}
 
 	if dongle, dongleexists := deviceManager[selectedDongle]; dongleexists {
+		// -- Bluetooth section --
+		startMenu = append(startMenu, menuItem{id: -1, label: "--- Bluetooth ---"})
 		startMenu = append(startMenu, menuItem{id: 0, label: "Search For New Devices"})
 		if dongle.featureFlags.pairingList && dongle.pairingList.count != 0 {
-			startMenu = append(startMenu, menuItem{id: 1, label: "See Remembered Paired Devices"})
+			startMenu = append(startMenu, menuItem{id: 1, label: "Paired Devices"})
 		}
+
+		// -- Settings section --
+		startMenu = append(startMenu, menuItem{id: -1, label: "--- Settings ---"})
 		startMenu = append(startMenu, menuItem{id: 2, label: fmt.Sprintf("%s Settings", dongle.deviceName)})
 	}
 
-	// TODO
-	// if len(deviceManager) > 2 {
-	// 	startMenu = append(startMenu, menuItem{id: 3, label: "Switch Device"})
-	// }
-
 	if device, deviceexists := deviceManager[selectedHeadset]; deviceexists {
 		startMenu = append(startMenu, menuItem{id: 4, label: fmt.Sprintf("%s Settings", device.deviceName)})
-	}
-
-	if len(deviceManager) > 0 {
-		startMenu = append(startMenu, menuItem{id: 6, label: "Device Info"})
 	}
 
 	if currentAudioState == nil {
@@ -498,8 +475,14 @@ func updateStartMenu() {
 		startMenu = append(startMenu, menuItem{id: 7, label: "Audio Settings"})
 	}
 
-	startMenu = append(startMenu, menuItem{id: 5, label: "Exit"})
+	if len(deviceManager) > 0 {
+		// -- Info section --
+		startMenu = append(startMenu, menuItem{id: -1, label: "--- Info ---"})
+		startMenu = append(startMenu, menuItem{id: 6, label: "Device Info"})
+	}
 
+	startMenu = append(startMenu, menuItem{id: -1, label: ""})
+	startMenu = append(startMenu, menuItem{id: 5, label: "Exit"})
 }
 
 func serialNumberCheck(deviceInfo *jabra_DeviceInfo) bool {
@@ -557,12 +540,15 @@ func (d *devices) add(deviceInfo *jabra_DeviceInfo) {
 	if deviceInfo.isDongle {
 		if selectedDongle == -1 {
 			selectedDongle = id
-			go updatePairingList()
 		}
 	} else {
 		if selectedHeadset == -1 {
 			selectedHeadset = id
-			go batteryStatusUpdate()
+		} else if existing, ok := (*d)[selectedHeadset]; ok &&
+			existing.deviceConnection == deviceConnectionType_USB &&
+			deviceInfo.deviceConnection == deviceConnectionType_BT {
+			// Prefer BT-connected device (actual headset) over USB (deskstand/dock)
+			selectedHeadset = id
 		}
 	}
 
@@ -602,11 +588,9 @@ func (d *devices) removed(deviceID uint16) {
 		nextIndex++
 	}
 	if !checkDongleExists {
-		stopUpdatePairingList <- struct{}{}
 		selectedDongle = -1
 	}
 	if !checkHeadSetExists {
-		stopUpdateBattery <- struct{}{}
 		selectedHeadset = -1
 		linkQualitySet = false
 	}
@@ -1521,6 +1505,16 @@ func firmwareProgressFunc(deviceID C.ushort, eventType C.Jabra_FirmwareEventType
 		fwUpdateState.phase = fwPhaseError
 		fwUpdateState.errorMsg = firmwareEventStatusToString(int(status))
 		fwUpdateState.statusMsg = fwUpdateState.errorMsg
+	}
+
+	select {
+	case chFirmwareProgress <- firmwareProgressEvent{
+		deviceID:   uint16(deviceID),
+		eventType:  int(eventType),
+		status:     int(status),
+		percentage: int(percentage),
+	}:
+	default:
 	}
 }
 

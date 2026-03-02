@@ -12,21 +12,13 @@ import "C"
 import (
 	"fmt"
 	"log"
-	"os"
 	"unsafe"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // sudo apt install libasound2 libcurl4
 func main() {
-
-	oldSettings, err := enableRawMode()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Failed to enable raw mode:", err)
-		return
-	}
-	defer restoreTerminal(oldSettings)
-	go startKeysPressedListener()
-
 	appId := C.CString("JabraLink")
 	C.Jabra_SetAppID(appId)
 	defer C.free(unsafe.Pointer(appId))
@@ -51,14 +43,11 @@ func main() {
 	// the `levelInPercent` callback is sometimes delayed. This causes issues with timely updates.
 	// We need to ensure that the callback is triggered in a more predictable and consistent manner.
 	// C.Jabra_RegisterBatteryStatusUpdateCallbackV2((*[0]byte)(unsafe.Pointer(C.batteryStatusUpdate)))
-	defer close(stopUpdateBattery)
-	defer close(stopUpdatePairingList)
 
-	fmt.Print("\x1b[?25l")       // Hide cursor
-	defer fmt.Print("\x1b[?25h") // Show cursor again
-	clearScreen()
-	startUi()
+	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		log.Fatalln(err)
+	}
 
-	fmt.Println("\n\nThank you for using jlink! (ʘ‿ʘ)╯")
-
+	fmt.Println("\nThank you for using jLink!")
 }
