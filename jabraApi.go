@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 	"unsafe"
 )
 
@@ -211,6 +212,77 @@ type equalizerBand struct {
 	maxGain         float32
 	centerFrequency int
 	currentGain     float32
+}
+
+// EQ presets: gains in dB for 5 bands (Sub-bass, Bass, Mid, Presence, Brilliance).
+// Values are clamped to the device's maxGain when applied.
+type eqPreset struct {
+	name  string
+	gains [5]float32
+}
+
+var eqPresets = []eqPreset{
+	{name: "Flat", gains: [5]float32{0, 0, 0, 0, 0}},
+	{name: "Speech", gains: [5]float32{-2, -1, 1, 3, 1.5}},
+	{name: "Bass Boost", gains: [5]float32{4, 2.5, 0, 0, 0}},
+	{name: "Treble Boost", gains: [5]float32{0, 0, 0, 2, 4}},
+	{name: "Podcast", gains: [5]float32{-3, -1.5, 1.5, 3.5, 1}},
+	{name: "Smooth", gains: [5]float32{1, 0.5, 0, -1, -0.5}},
+	{name: "Energize", gains: [5]float32{2, 0.5, -1, 1.5, 3}},
+	{name: "Deep Bass", gains: [5]float32{6, 4, 1, 0, -1}},
+}
+
+func applyEQPreset(deviceID uint16, bands []equalizerBand, presetIdx int) {
+	if presetIdx < 0 || presetIdx >= len(eqPresets) || len(bands) == 0 {
+		return
+	}
+	preset := eqPresets[presetIdx]
+	gains := make([]float32, len(bands))
+	for i := range bands {
+		g := float32(0)
+		if i < len(preset.gains) {
+			g = preset.gains[i]
+		}
+		// Clamp to device limits
+		if g > bands[i].maxGain {
+			g = bands[i].maxGain
+		}
+		if g < -bands[i].maxGain {
+			g = -bands[i].maxGain
+		}
+		gains[i] = g
+		bands[i].currentGain = g
+	}
+	setEqualizerParameters(deviceID, gains)
+}
+
+// detectEQPreset checks if current band gains match any known preset.
+// Returns preset index or -1 for custom.
+func detectEQPreset(bands []equalizerBand) int {
+	for idx, preset := range eqPresets {
+		match := true
+		for i := range bands {
+			expected := float32(0)
+			if i < len(preset.gains) {
+				expected = preset.gains[i]
+				if expected > bands[i].maxGain {
+					expected = bands[i].maxGain
+				}
+				if expected < -bands[i].maxGain {
+					expected = -bands[i].maxGain
+				}
+			}
+			diff := bands[i].currentGain - expected
+			if diff < -0.5 || diff > 0.5 {
+				match = false
+				break
+			}
+		}
+		if match {
+			return idx
+		}
+	}
+	return -1
 }
 
 type deviceSetting struct {
@@ -1853,8 +1925,25 @@ func getActiveProfile(deviceID int) int {
 }
 
 func setAudioProfile(deviceID, index int) error {
-	return exec.Command("pw-cli", "set-param", strconv.Itoa(deviceID), "Profile",
+	err := exec.Command("pw-cli", "set-param", strconv.Itoa(deviceID), "Profile",
 		fmt.Sprintf("{ index: %d }", index)).Run()
+	if err != nil {
+		return err
+	}
+
+	// After profile change, PipeWire recreates sink/source nodes with new IDs.
+	// Re-discover and set as default so audio doesn't fall back to built-in speakers.
+	time.Sleep(500 * time.Millisecond)
+	state := discoverPipeWireDevice()
+	if state != nil {
+		if state.sinkID >= 0 {
+			exec.Command("wpctl", "set-default", strconv.Itoa(state.sinkID)).Run()
+		}
+		if state.sourceID >= 0 {
+			exec.Command("wpctl", "set-default", strconv.Itoa(state.sourceID)).Run()
+		}
+	}
+	return nil
 }
 
 func getVolume(nodeID int) float64 {

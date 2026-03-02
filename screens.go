@@ -454,10 +454,12 @@ func (m model) updateHeadsetSettings(msg tea.KeyMsg) (model, tea.Cmd) {
 			case 1: // Equalizer
 				m.screen = screenEqualizer
 				m.cursor = 0
+				m.eqPresetIndex = -1 // Start as custom, detect below
 				if device, exists := deviceManager[selectedHeadset]; exists {
 					bands, err := getEqualizerParameters(device.deviceID)
 					if err == nil {
 						m.eqBands = bands
+						m.eqPresetIndex = detectEQPreset(bands)
 					}
 				}
 			case 2: // Sidetone toggle
@@ -834,12 +836,20 @@ func (m model) updateEqualizer(msg tea.KeyMsg) (model, tea.Cmd) {
 		if m.cursor < len(m.eqBands)-1 {
 			m.cursor++
 		}
+	case "p": // Cycle EQ preset
+		if len(m.eqBands) > 0 {
+			m.eqPresetIndex = (m.eqPresetIndex + 1) % len(eqPresets)
+			if device, exists := deviceManager[selectedHeadset]; exists {
+				applyEQPreset(device.deviceID, m.eqBands, m.eqPresetIndex)
+			}
+		}
 	case "a":
 		if len(m.eqBands) > 0 && m.cursor < len(m.eqBands) {
 			band := &m.eqBands[m.cursor]
 			newGain := band.currentGain - 1.0
 			if newGain >= -band.maxGain {
 				band.currentGain = newGain
+				m.eqPresetIndex = -1 // Mark as custom
 				if device, exists := deviceManager[selectedHeadset]; exists {
 					gains := make([]float32, len(m.eqBands))
 					for i, b := range m.eqBands {
@@ -855,6 +865,7 @@ func (m model) updateEqualizer(msg tea.KeyMsg) (model, tea.Cmd) {
 			newGain := band.currentGain + 1.0
 			if newGain <= band.maxGain {
 				band.currentGain = newGain
+				m.eqPresetIndex = -1 // Mark as custom
 				if device, exists := deviceManager[selectedHeadset]; exists {
 					gains := make([]float32, len(m.eqBands))
 					for i, b := range m.eqBands {
@@ -871,7 +882,14 @@ func (m model) updateEqualizer(msg tea.KeyMsg) (model, tea.Cmd) {
 func (m model) viewEqualizer() string {
 	var lines []string
 
-	lines = append(lines, titleStyle.Render("Equalizer"))
+	// Header with preset name
+	presetLabel := "Custom"
+	if m.eqPresetIndex >= 0 && m.eqPresetIndex < len(eqPresets) {
+		presetLabel = eqPresets[m.eqPresetIndex].name
+	}
+	lines = append(lines, titleStyle.Render("Equalizer")+"  "+
+		mutedStyle.Render("Preset: ")+accentTextStyle.Render(presetLabel)+"  "+
+		mutedStyle.Render("(P cycle)"))
 	lines = append(lines, "")
 
 	for i, band := range m.eqBands {
@@ -899,7 +917,7 @@ func (m model) viewEqualizer() string {
 	}
 
 	lines = append(lines, "")
-	lines = append(lines, renderFooter([]string{"Q Back", "A/D Adjust"}))
+	lines = append(lines, renderFooter([]string{"Q Back", "A/D Adjust", "P Preset"}))
 
 	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }

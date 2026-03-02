@@ -58,6 +58,7 @@ type model struct {
 	searchResults    []pairedDevice
 	pairedDevices    []pairedDevice
 	eqBands          []equalizerBand
+	eqPresetIndex    int // -1 = custom, 0..N = preset index
 	ancState         *ancScreenState
 	audio            *audioState
 	infoLines        []string
